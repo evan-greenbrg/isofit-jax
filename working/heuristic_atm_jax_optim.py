@@ -3,11 +3,12 @@ from functools import partial
 import os
 import itertools
 
+import click
 from matplotlib import pyplot as plt
 import numpy as np
 import xarray as xr
 
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=10'
+os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=1'
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P, NamedSharding
@@ -19,12 +20,111 @@ from isofit.radiative_transfer.luts import load
 from isofit.core.common import envi_header
 from isofit.core.geometry import Geometry
 from isofit.core.fileio import IO
-from isofit import ray
+# from isofit import ray
 
 from isojax.common import largest_divisible_core
 from isojax.lut import lut_grid, check_bounds
 from isojax.interpolator import multilinear_interpolator
-from isojax.inversions import invert_algebraic
+from isojax.inversions import invert_algebraic, heuristic_atmosphere
+
+
+def main(lut_path, rdn_file, obs_file, loc_file, fixed_aod=0.1, batchsize=1000):
+    lut = load(lut_path)
+    lut_names = list(lut.coords)[2:]
+    jlut = lut_grid(lut, lut_names)
+
+    rdn = envi.open(envi_header(rdn_file))
+    rdn_im = rdn.open_memmap(interleave='bip')
+    wl = np.array(rdn.metadata['wavelength']).astype(float)
+
+    obs = envi.open(envi_header(obs_file))
+    obs_im = obs.open_memmap(interleave='bip')
+
+    loc = envi.open(envi_header(loc_file))
+    loc_im = loc.open_memmap(interleave='bip')
+
+    meas_list = np.reshape(
+        rdn_im, 
+        (rdn_im.shape[0] * rdn_im.shape[1], rdn_im.shape[2])
+    )
+
+    obs_flat = np.reshape(
+        obs_im,
+        (rdn_im.shape[0] * rdn_im.shape[1], obs_im.shape[2])
+    )
+    loc_flat = np.reshape(
+        loc_im,
+        (rdn_im.shape[0] * rdn_im.shape[1], loc_im.shape[2])
+    )
+
+    # Construct "Geom"
+    temp_aod = 0.1
+    temp_h2o = 2.0
+    point_list = np.zeros((len(obs_flat), 6))
+    point_list[:, 0] = temp_aod
+    point_list[:, 1] = temp_h2o
+    point_list[:, 2] = obs_flat[:, 2]
+
+    delta_phi = np.abs(obs_flat[:, 3] - obs_flat[:, 1])
+    point_list[:, 3] = np.minimum(delta_phi, 360 - delta_phi)
+    point_list[:, 4] = obs_flat[:, 4]
+    point_list[:, 5] = loc_flat[:, 2]
+
+    bounds = np.array([
+        [
+            np.min(lut.coords['AOT550'].values),
+            np.max(lut.coords['AOT550'].values)
+        ],
+        [
+            np.min(lut.coords['H2OSTR'].values),
+            np.max(lut.coords['H2OSTR'].values)
+        ],
+        [
+            np.min(lut.coords['observer_zenith'].values),
+            np.max(lut.coords['observer_zenith'].values)
+        ],
+        [
+            np.min(lut.coords['relative_azimuth'].values),
+            np.max(lut.coords['relative_azimuth'].values)
+        ],
+        [
+            np.min(lut.coords['solar_zenith'].values),
+            np.max(lut.coords['solar_zenith'].values)
+        ],
+        [
+            np.min(lut.coords['surface_elevation_km'].values),
+            np.max(lut.coords['surface_elevation_km'].values)
+        ],
+    ])
+
+    point_list = check_bounds(
+        point_list,
+        bounds[:, 0],
+        bounds[:, 1]
+    )
+
+    b865 = np.argmin(abs(wl - 865))
+    b945 = np.argmin(abs(wl - 945))
+    b1040 = np.argmin(abs(wl - 1040))
+
+    h2os = heuristic_atmosphere(
+        jnp.array(np.unique(lut.coords['H2OSTR'].data)),
+        meas_list, 
+        point_list, 
+        jlut, 
+        fix_aod=fixed_aod, 
+        batchsize=batchsize, 
+        b865=b865,
+        b945=b945,
+        b1040=b1040
+    )
+
+    h2os = np.reshape(h2os, (rdn.shape[0], rdn.shape[1]))
+
+    # Save file
+
+
+@click.command()
 
 
 

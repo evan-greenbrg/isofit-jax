@@ -9,7 +9,6 @@ from matplotlib import pyplot as plt
 import numpy as np
 import xarray as xr
 
-os.environ['XLA_FLAGS'] = '--xla_force_host_platform_device_count=10'
 import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P, NamedSharding

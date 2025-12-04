@@ -1,3 +1,9 @@
+from isofit.configs import configs
+
+from isojax.forward import ForwardModel
+from isojax.surface import MultiComponentSurface
+
+
 config_path = '/Users/bgreenbe/Projects/AOD/emit20220818t205752_blackrock_6c/config/emit20220818t205752_isofit.json'
 config = configs.create_new_config(config_path)
 fm = ForwardModel(config)
@@ -78,10 +84,11 @@ h2os = heuristic_atmosphere(
     batchsize=1000, 
     b865=b865,
     b945=b945,
-    b1040=b1040
+    b1040=b1040,
+    nshard=14
 )
 
-h2os = np.reshape(h2os, (rdn.shape[0], rdn.shape[1]))
+# h2os = np.reshape(h2os, (rdn.shape[0] * rdn.shape[1]))
 
 point_list = point_list.at[:, 0].set(fix_aod)
 point_list = point_list.at[:, 1].set(h2os)

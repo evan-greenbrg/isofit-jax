@@ -155,15 +155,11 @@ class Instrument:
         Input: meas, a vector of size n_chan
         Returns: Kb_instrument, a matrix of size [n_measurements x nb_instrument]
         """
-        @partial(
-            jax.vmap,
-            in_axes=(0, None)
-        )
         def hstack(diagflat_rdn, zeros):
             return jnp.hstack((diagflat_rdn, zeros))
 
         # Uncertainty due to radiometric calibration
-        return hstack(jax.vmap(jnp.diagflat)(meas), jnp.zeros((self.n_chan, 2)))
+        return hstack(jnp.diagflat(meas), jnp.zeros((self.n_chan, 2)))
 
     def Sy(self, meas):
         """
@@ -175,4 +171,4 @@ class Instrument:
         )
         nedl = nedl / jnp.sqrt(self.integrations)
 
-        return jax.vmap(jnp.diagflat)(jnp.power(nedl, 2))
+        return jnp.diagflat(jnp.power(nedl, 2))

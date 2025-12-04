@@ -1,3 +1,4 @@
+from copy import deepcopy
 from functools import partial
 
 import numpy as np
@@ -7,6 +8,7 @@ import jax.numpy as jnp
 from isofit.core.common import load_wavelen
 
 from isojax.interpolator import interp1d
+from isojax.forward import ForwardModel
 
 
 def retrieve_winidx(config):
@@ -23,6 +25,18 @@ def retrieve_winidx(config):
     return winidx
 
 
+def p_tilde(h, p):
+    # ((h.T @ p) @ h).T)
+    return jnp.einsum(
+        'jk->kj',
+        jnp.einsum(
+            'kj,jl->kl',
+            jnp.einsum('jk,lj->kj', h, p),
+            h
+        )
+    )
+
+
 def symv(alpha, A, x, beta=0, y=0):
     return alpha * (A @ x) + beta * y
 
@@ -36,13 +50,31 @@ def vsymv(c_rcond, p, h, meas_i, l_atm, prprod_i):
         h.T @ symv(1, p, meas_i[winidx] - l_atm[winidx]) + prprod_i
     )
 
-
+@partial(jax.jit, static_argnums=1)
 def dpotri_jax(L, lower=True):
     n = L.shape[0]
     I = jnp.eye(n, dtype=L.dtype)
     # cho_solve solves A X = B using the Cholesky factor.
-    inv_A = jax.scipy.linalg.cho_solve((L, lower), I)
-    return inv_A
+    Y = jax.lax.linalg.triangular_solve(
+        a=L,
+        b=I,
+        left_side=False,
+        transpose_a=False,
+        conjugate_a=False,
+        unit_diagonal=False,
+        lower=lower,
+    )
+    X = jax.lax.linalg.triangular_solve(
+        a=L,
+        b=Y,
+        left_side=False,
+        transpose_a=True,
+        conjugate_a=False,
+        unit_diagonal=False,
+        lower=lower,
+    )
+    return X
+    # return jax.scipy.linalg.cho_solve((L, lower), I)
 
 
 @jax.jit
@@ -139,94 +171,213 @@ def heuristic_atmosphere(h2o_grid, meas_list, point_list, jlut,
     return h2os
 
 
-@partial(
-    jax.vmap,
-    in_axes=(None, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, None)
-)
-def invert_analytical_point(fm, x0_i, meas_i, sub_i, point_i, ci_i,
-                            lamb_norm_i, L_atm, L_dir_dir,
-                            L_dir_dif, L_dif_dir, L_dif_dif,
-                            s_alb, winidx):
+class InvertAnalytical:
+    def __init__(self, fm):
+        self.fm = fm
 
-    rho_dir_dir, rho_dif_dir = fm.surface.calc_rfl(sub_i[jnp.newaxis, :])
-    background = jnp.multiply(rho_dif_dir, s_alb[jnp.newaxis, :])
-    H = fm.surface.analytical_model(
-        background,
-        (L_dir_dir + L_dir_dif + L_dif_dir + L_dif_dif)[jnp.newaxis]
-    )[:, winidx, :]
-    Seps = fm.Seps(
-        x0_i[jnp.newaxis, :],
-        meas_i[jnp.newaxis, :],
-        point_i[jnp.newaxis, :],
-        jlut
-    )[:, winidx, :][..., winidx]
-    Sa, Sa_inv, Sa_inv_sqrt = fm.surface.Sa(ci_i, lamb_norm_i)
-    xa = fm.surface.xa(x0_i[jnp.newaxis, :], lamb_norm_i)
-    prprod = jax.vmap(jnp.matmul)(Sa_inv[jnp.newaxis, ...], xa)
+    def invert(self, x, meas, point, sub, s_alb,
+                          L_tot, L_atm, ci, lamb_norm):
 
-    C = jax.lax.linalg.cholesky(Seps)
-    L = jax.vmap(dpotri_jax)(C)
+        seps = self.fm.Seps(x, meas, point)
 
-    P_tilde = jax.vmap(lambda h, p: ((h.T @ p) @ h).T)(H, L)
-    P_rcond = Sa_inv + P_tilde
-
-    LI_rcond = jax.lax.linalg.cholesky(P_rcond)
-    C_rcond = jax.vmap(dpotri_jax)(LI_rcond)
-    C_rcond_sym = jax.vmap(lambda c: (c + c.T) * .5)(C_rcond)
-
-    # @jax.vmap
-    def vsymv(c_rcond, p, h, meas_i, l_atm, prprod_i):
-        return symv(
-            1,
-            c_rcond,
-            h.T @ symv(1, p, meas_i[winidx] - l_atm[winidx]) + prprod_i
+        H = self.fm.surface.analytical_model(
+            jnp.multiply(sub, s_alb),
+            L_tot
         )
-    return vsymv(
-        C_rcond[0, ...],
-        L[0, ...],
-        H[0, ...],
-        meas_i,
-        L_atm,
-        prprod[0, ...]
+
+        Sa, Sa_inv, Sa_inv_sqrt = self.fm.surface.Sa(
+            ci,
+            lamb_norm
+        )
+        xa = self.fm.surface.xa(x, lamb_norm)
+        prprod = jnp.matmul(Sa_inv, xa)
+
+        C = jax.lax.linalg.cholesky(seps)
+        L = dpotri_jax(C)
+
+        P_tilde = p_tilde(H, L)
+        P_rcond = jnp.add(Sa_inv, P_tilde)
+
+        LI_rcond = jax.lax.linalg.cholesky(P_rcond)
+        C_rcond = dpotri_jax(LI_rcond)
+
+        def vsymv(c_rcond, p, h, meas_i, l_atm, prprod_i):
+            return symv(
+                1,
+                c_rcond,
+                h.T @ symv(1, p, meas_i - l_atm) + prprod_i
+            )
+
+        xk = vsymv(C_rcond, L, H, meas, L_atm, prprod)
+
+        return xk
+
+
+def svd_inv_sqrt(C):
+    D, P = jnp.linalg.eigh(C)
+    Ds = jnp.diag(1 / jnp.sqrt(D))
+    L = jnp.matmul(P, Ds)
+
+    return jnp.matmul(L, jnp.einsum('ij->ji', P))
+
+
+class Invert:
+    def __init__(self, fm):
+        self.fm = fm
+
+        self.winidx = retrieve_winidx(fm.full_config)
+        self.winidx_mask = jnp.zeros(len(fm.idx_surface))
+        self.winidx_mask = self.winidx_mask.at[self.winidx].set(1)
+
+        self.idx_surface = 285
+
+    def step(self):
+        def loss(param, meas, point, xa, Sa):
+            point = point.at[0].set(param['aod'])
+            point = point.at[1].set(param['h2o'])
+            # svd function needs to be optimized
+            seps_inv_sqrt = svd_inv_sqrt(fm.Seps(
+                param['surface'], 
+                meas,
+                point
+            ))
+
+            # This is going to slow me down
+            pred = self.fm.RT.calc_rdn(
+                param['surface'],
+                param['surface'],
+                self.fm.RT.jlut['rhoatm'](point[None, :])[0],
+                self.fm.RT.jlut['sphalb'](point[None, :])[0],
+                self.fm.RT.jlut['dir_dir'](point[None, :])[0],
+                self.fm.RT.jlut['dif_dir'](point[None, :])[0],
+                self.fm.RT.jlut['dir_dif'](point[None, :])[0],
+                self.fm.RT.jlut['dif_dif'](point[None, :])[0],
+            )
+            # Measurement portion scaled by instrument noise
+            meas_resid = ((pred - meas).dot(seps_inv_sqrt))
+
+            # Prior portion scaled by prior covariance
+            # TODO add in the atm prior means and covaraince
+            prior_resid = (
+                ((
+                    jnp.concatenate([
+                        param['surface'],
+                        jnp.array([param['aod']]),
+                        jnp.array([param['h2o']])
+                    ]) - xa
+                ).dot(Sa_inv_sqrt))
+            ) * jnp.concatenate([self.winidx_mask, jnp.array([1., 1.])])
+
+            # The square error isn't working...
+            return jnp.sum(
+                jnp.power(jnp.concatenate((meas_resid, prior_resid)), 2),
+            )
+
+        return jax.value_and_grad(loss)
+
+
+iv = Invert(fm)
+
+def fit(param, meas, point, xa, Sa, opt_state):
+    value, grad = iv.step()(param, meas, point, xa, Sa)
+    updates, opt_state = optimizer.update(grad, opt_state)
+    params = optax.apply_updates(param, updates)
+
+    return params, opt_state, grad
+
+fit_vmap = jax.jit(jax.vmap(fit))
+learning_rate = 3e-3
+# optimizer = optax.adam(learning_rate)
+nsteps=100
+
+cmap_name = 'winter'
+cmap = plt.get_cmap(cmap_name)
+colors = [cmap(i) for i in np.linspace(0, 1, nsteps)]
+
+for i in range(2):
+# Set up the inversion for a single pixel
+    x = x0[i, ...]
+    meas = meas_list[i, ...]
+    point = point_list[i, ...]
+    ci = cis[i]
+    lamb_norm = x0_norm[i]
+    atm = atm_flat[i, ...]
+
+    seps = fm.Seps(x, meas, point)
+    seps_inv_sqrt = svd_inv_sqrt(seps)
+    xa = fm.xa(x, lamb_norm)
+    Sa, Sa_inv, Sa_inv_sqrt = fm.Sa(
+        ci,
+        lamb_norm
     )
 
 
-# @partial(
-#     jax.jit,
-#     static_argnames=['fm']
-# )
-def invert_analytical(fm, x0, meas, sub, points, ci, lamb_norm, seps_d,
-                      L_atm_d, L_tot_d, s_alb_d, winidx):
-    # Calculate background
-    rho_dir_dir, rho_dif_dir = fm.surface.calc_rfl(sub)
-    background = jnp.multiply(rho_dif_dir, s_alb_d)
+    param = {
+        'surface': x,
+        'aod': atm[0],
+        'h2o': atm[1],
+    }
+    transforms = {
+        'surface': optax.adam(learning_rate=3e-3),
+        'aod': optax.adam(learning_rate=3e-3),
+        'h2o': optax.adam(learning_rate=1e-1),
+    }
+    optimizer = optax.multi_transform(
+        transforms,
+        {'surface': 'surface', 'aod': 'aod', 'h2o': 'h2o'}
+    )
 
-    H = fm.surface.analytical_model(
-        background,
-        L_tot_d
-    )[:, winidx, :]
+    opt_state = optimizer.init(param)
 
-    Sa, Sa_inv, Sa_inv_sqrt = fm.surface.Sa(ci, lamb_norm)
-    xa = fm.surface.xa(x0, lamb_norm)
-    prprod = jax.vmap(jnp.matmul)(Sa_inv, xa)
+    params = []
+    grads = []
+    for i in range(nsteps):
+        print(i)
+        param, opt_state, grad = fit(param, meas, point, xa, Sa, opt_state)
+        params.append(param)
+        grads.append(grad)
 
-    C = jax.lax.linalg.cholesky(seps_d)
-    L = jax.vmap(dpotri_jax)(C)
+    # TODO The gradients are bad. The optimization is wrong.
+    for param, grad in zip(params, grads):
+        break
+    params = np.array(params)
+    grads = np.array(grads)
 
-    P_tilde = jax.vmap(lambda h, p: ((h.T @ p) @ h).T)(H, L)
-    P_rcond = Sa_inv + P_tilde
+    fig, axs = plt.subplots(2, 1, sharex=True)
+    for i in range(nsteps):
+        axs[0].plot(wl, params[i,:285], color=colors[i])
+        axs[1].plot(wl, grads[i,:285], color=colors[i])
+    # plt.plot(wl, params[0, :], color='black', ls='--', lw=2)
+    # plt.plot(wl, params[-1, :], color='black', lw=2)
+    axs[0].set_ylim([-.05, .5])
+    # axs[1].set_ylim([-.05, .5])
+    plt.show()
 
-    LI_rcond = jax.lax.linalg.cholesky(P_rcond)
-    C_rcond = jax.vmap(dpotri_jax)(LI_rcond)
-    C_rcond_sym = jax.vmap(lambda c: (c + c.T) * .5)(C_rcond)
+    fig, axs = plt.subplots(2, 2, sharex=True)
+    axs[0, 0].set_ylabel('AOD')
+    axs[0, 0].scatter(
+        [i for i in range(nsteps)],
+        params[:, -2]
+    )
+    axs[1, 0].set_ylabel('AOD Grad')
+    axs[1, 0].scatter(
+        [i for i in range(nsteps)],
+        grads[:, -2]
+    )
+    axs[0, 1].set_ylabel('H2O')
+    axs[0, 1].scatter(
+        [i for i in range(nsteps)],
+        params[:, -1]
+    )
+    axs[1, 1].set_ylabel('H2O Grad')
+    axs[1, 1].scatter(
+        [i for i in range(nsteps)],
+        grads[:, -1]
+    )
+    plt.show()
+    break
 
-    @jax.vmap
-    def vsymv(c_rcond, p, h, meas_i, l_atm, prprod_i):
+# Set up params
+opt_state = optimizer.init(params)
 
-        return symv(
-            1,
-            c_rcond,
-            h.T @ symv(1, p, meas_i[winidx] - l_atm[winidx]) + prprod_i
-        )
-
-    return vsymv(C_rcond, L, H, meas, L_atm_d, prprod)
+# Step function should pull seps, pred, xa, Sa all from params

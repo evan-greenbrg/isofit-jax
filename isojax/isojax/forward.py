@@ -1,22 +1,4 @@
 #! /usr/bin/env python3
-#
-#  Copyright 2018 California Institute of Technology
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-#
-# ISOFIT: Imaging Spectrometer Optimal FITting
-# Author: Evan Greenberg, evan.greenberg@jpl.nasa.gov
-#
 from __future__ import annotations
 
 import logging
@@ -62,7 +44,7 @@ class ForwardModel:
     noise for the purpose of weighting the measurement information
     against the prior."""
 
-    def __init__(self, full_config: Config, cache_RT: RadiativeTransfer = None):
+    def __init__(self, full_config: Config, jlut: dict):
         # load in the full config (in case of inter-module dependencies) and
         # then designate the current config
         self.full_config = full_config
@@ -72,10 +54,7 @@ class ForwardModel:
         self.n_meas = self.instrument.n_chan
 
         # Build the radiative transfer model
-        if cache_RT:
-            self.RT = cache_RT
-        else:
-            self.RT = RadiativeTransfer(self.full_config)
+        self.RT = RadiativeTransfer(self.full_config, jlut)
 
         # Build the surface model
         self.surface = MultiComponentSurface(full_config)
@@ -159,13 +138,10 @@ class ForwardModel:
             self.model_discrepancy = None
 
     def calc_meas(self, x, L_atm, s_alb, L_dir_dir, L_dif_dir, L_dir_dif, L_dif_dif):
-        rho_dir_dir, rho_dif_dir = self.surface.calc_rfl(
-            x[:, self.idx_surface]
-        )
 
         return self.RT.calc_rdn(
-            rho_dir_dir,
-            rho_dif_dir,
+            x,
+            x,
             L_atm,
             s_alb,
             L_dir_dir,
@@ -174,26 +150,23 @@ class ForwardModel:
             L_dif_dif,
         )
 
-    def Seps(self, x, meas, points, jlut):
-        if self.model_discrepancy is not None:
-            Gamma = self.model_discrepancy
-        else:
-            Gamma = 0
+    def Seps(self, x, meas, points):
 
-        @partial(
-            jax.vmap,
-            in_axes=(0, 0, None)
-        )
-        def calc(Sy, Kb, Gamma): 
-            return Sy + Kb.dot(self.Sb).dot(Kb.T) + Gamma
-        
-        return calc(
-            self.instrument.Sy(meas),
-            self.Kb(meas, x, points, jlut),
-            Gamma
+        Sy = self.instrument.Sy(meas)
+        Kb = self.Kb(meas, x, points)
+
+        dot = jnp.einsum(
+            'ij,jl->il',
+            jnp.einsum(
+                'ij,jl->ij',
+                Kb, self.Sb
+            ), 
+            jnp.einsum('jk->kj', Kb)
         )
 
-    def Kb(self, meas, x, points, jlut):
+        return Sy + dot + self.model_discrepancy
+
+    def Kb(self, meas, x, points):
         """Derivative of measurement with respect to unmodeled & unretrieved
         unknown variables, e.g. S_b. This is  the concatenation of Jacobians
         with respect to parameters of the surface, radiative transfer model,
@@ -202,87 +175,45 @@ class ForwardModel:
 
         Has to be part of vmap??
         """
-        # Call surface reflectance w.r.t. surface, upsample
-        rho_dir_dir, rho_dif_dir = self.surface.calc_rfl(
-            x[:, self.idx_surface]
-        )
-
         dRTb = self.RT.drdn_dRTb(
             points,
-            rho_dir_dir,
-            rho_dif_dir,
-            jlut,
+            x,
+            x,
         )
 
-        # To get derivatives w.r.t. instrument, downsample to instrument wavelengths
         dinstrumentb = self.instrument.dmeas_dinstrumentb(meas)
 
-        @jax.vmap
-        def combine(dRTb, dinstrumentb):
-            # Put it together
-            Kb = jnp.zeros((self.n_meas, self.nbvec), dtype=float)
-            Kb = Kb.at[:, self.RT_b_inds].set(dRTb[:, jnp.newaxis])
-            Kb = Kb.at[:, self.instrument_b_inds].set(dinstrumentb)
-            return Kb
-
-        return combine(dRTb, dinstrumentb)
+        return jnp.concatenate((dRTb[:, None], dinstrumentb), axis=1)
 
     def xa(self, x, lamb_norm):
         xa_surface = self.surface.xa(x, lamb_norm)
         xa_RT = self.RT.xa
 
-        @partial(
-            jax.vmap,
-            in_axes=(0, None)
-        )
-        def concat(xa_surface, xa_RT):
-            return jnp.concatenate((xa_surface, xa_RT), axis=0)
-        
-        return concat(xa_surface, xa_RT)
+        return jnp.concatenate([xa_surface, xa_RT])
 
     def Sa(self, ci, lamb_norm):
         (
             Sa_surface,
-            Sa_inv_norm,
-            Sa_inv_sqrt_norm
+            Sa_surface_inv,
+            Sa_surface_inv_sqrt
         ) = self.surface.Sa(ci, lamb_norm)
 
-        Sa = jax.vmap(
-            jax.scipy.linalg.block_diag,
-            in_axes=(0, None)
-        )(Sa_surface, self.RT.Sa)
+        (
+            Sa_RT,
+            Sa_RT_inv,
+            Sa_RT_inv_sqrt
+        ) = self.RT.Sa()
 
-        @jax.vmap
-        def calc_scale(Sa):
-            return jnp.sqrt(jnp.mean(jnp.diag(Sa)))
-
-        scale = calc_scale(Sa)[:, jnp.newaxis]
-
-        @partial(
-            jax.vmap,
-            in_axes=(0, None, 0)
+        _Sa = jax.scipy.linalg.block_diag(Sa_surface, Sa_RT)
+        _Sa_inv = jax.scipy.linalg.block_diag(
+            Sa_surface_inv,
+            Sa_RT_inv
         )
-        def block_and_scale(inv_surface, inv_RT, scale):
-            return (
-                jax.scipy.linalg.block_diag(
-                    inv_surface,
-                   inv_RT 
-                )
-                / jnp.pow(scale, 2)
-            )
-
-        Sa_inv = block_and_scale(
-            Sa_inv_norm,
-            self.RT.Sa_inv_norm,
-            scale
+        _Sa_inv_sqrt = jax.scipy.linalg.block_diag(
+            Sa_surface_inv_sqrt,
+            Sa_RT_inv_sqrt
         )
 
-        Sa_inv_sqrt = block_and_scale(
-            Sa_inv_sqrt_norm,
-            self.RT.Sa_inv_sqrt_norm,
-            scale
-        )
-
-        return Sa, Sa_inv, Sa_inv_sqrt
+        return _Sa, _Sa_inv, _Sa_inv_sqrt
 
 

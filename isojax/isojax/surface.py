@@ -137,10 +137,7 @@ class MultiComponentSurface(Surface):
         geometry object.
         """
         def distance(lamb_ref, ref_mu):
-            return jnp.sum(
-                jnp.power(jnp.subtract(lamb_ref, ref_mu), 2),
-                axis=1
-            )
+            return jnp.sum(jnp.power(jnp.subtract(lamb_ref, ref_mu), 2))
 
         distance_vmap = jax.vmap(distance, in_axes=(None, 0))
 
@@ -158,10 +155,14 @@ class MultiComponentSurface(Surface):
         )
 
     def Sa(self, ci, lamb_norm):
+
+        Sa = jnp.multiply(self.Sa_norm[ci, ...], lamb_norm **2)
+        scale = jnp.sqrt(jnp.mean(jnp.diag(Sa)))
+
         return (
-            self.Sa_norm[ci, ...] * lamb_norm[..., jnp.newaxis]**2,
-            self.Sa_inv_norm[ci, ...],
-            self.Sa_inv_sqrt_norm[ci, ...]
+            Sa,
+            jnp.divide(self.Sa_inv_norm[ci, ...], scale**2),
+            jnp.divide(self.Sa_inv_sqrt_norm[ci, ...] , scale)
         )
 
     def norm_Sa_cache(self):
@@ -171,16 +172,21 @@ class MultiComponentSurface(Surface):
 
         # hold as arrays of size: (n_comp, n_surface_state, n_surface_state)
         # Normalize the covariances
-        C = jnp.divide(
-            self.component_covs,
-            jnp.mean(jax.vmap(
-                jnp.diag, in_axes=0
-                )(self.component_covs), axis=1)[:, jnp.newaxis, jnp.newaxis]
+        C = self.component_covs
+        C_norm = jnp.divide(
+            C,
+            jnp.mean(
+                jax.vmap(
+                    jnp.diag, 
+                    in_axes=0
+                )(self.component_covs), 
+                axis=1
+            )[:, jnp.newaxis, jnp.newaxis]
         )
 
         # Is there a way to avoid this boolean??
         # This is not JAX friendly
-        D, P = jax.vmap(jnp.linalg.eigh)(C)
+        D, P = jax.vmap(jnp.linalg.eigh)(C_norm)
         inv_eps = 1e-6
         if jnp.any(D < 0) or jnp.any(np.isnan(D)):
             D, P = np.linalg.eigh(
@@ -194,7 +200,7 @@ class MultiComponentSurface(Surface):
         Cinv_sqrt = jnp.matmul(L, jax.vmap(lambda A: A.T)(P))
         Cinv = jnp.matmul(L, jax.vmap(lambda A: A.T)(L))
 
-        return C, Cinv, Cinv_sqrt
+        return C_norm, Cinv, Cinv_sqrt
 
 
     def fit_params(self, rfl_meas, geom, *args):

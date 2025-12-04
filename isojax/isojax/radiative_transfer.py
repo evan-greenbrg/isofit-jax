@@ -1,22 +1,3 @@
-#! /usr/bin/env python3
-#
-#  Copyright 2018 California Institute of Technology
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
-#
-# ISOFIT: Imaging Spectrometer Optimal FITting
-# Authors: Evan Greenberg, evan.greenberg@jpl.nasa.gov
-#
 from __future__ import annotations
 
 import logging
@@ -69,10 +50,11 @@ class RadiativeTransfer:
         "wavelength_file",
     ]
 
-    def __init__(self, full_config: Config):
+    def __init__(self, full_config: Config, jlut):
         config = full_config.forward_model.radiative_transfer
         confIT = full_config.forward_model.instrument
 
+        self.jlut = jlut
         self.lut_grid = config.lut_grid
         self.statevec_names = config.statevector.get_element_names()
 
@@ -105,10 +87,9 @@ class RadiativeTransfer:
         self.prior_sigma = jnp.array(self.prior_sigma)
 
         (
-            self.Sa,
-            self.Sa_norm,
-            self.Sa_inv_norm,
-            self.Sa_inv_sqrt_norm
+            self._Sa,
+            self.Sa_inv,
+            self.Sa_inv_sqrt
         ) = self.norm_Sa_cache()
 
         # Temporary I don't feel like debugging config rn
@@ -121,15 +102,17 @@ class RadiativeTransfer:
 
     def norm_Sa_cache(self):
         C = jnp.diagflat(jnp.power(self.prior_sigma, 2))
-        C_norm = C / jnp.mean(jnp.diag(C))
-        D, P = jnp.linalg.eigh(C_norm)
+        D, P = jnp.linalg.eigh(C)
         Ds = jnp.diag(1 / jnp.sqrt(D))
         L = jnp.matmul(P, Ds)
 
         Cinv_sqrt = jnp.matmul(L, P.T)
         Cinv = jnp.matmul(L, L.T)
 
-        return C, C_norm, Cinv, Cinv_sqrt
+        return C, Cinv, Cinv_sqrt
+
+    def Sa(self):
+        return self._Sa, self.Sa_inv, self.Sa_inv_sqrt
 
     @staticmethod
     def calc_rdn(
@@ -164,11 +147,7 @@ class RadiativeTransfer:
             ) / (1 - s_alb * rho_dif_dir)
         )
 
-    @partial(
-        jax.vmap,
-        in_axes=(None, 0, 0, 0, None)
-    )
-    def drdn_dRTb(self, point, rho_dir, rho_dif, jlut):
+    def drdn_dRTb(self, point, rho_dir, rho_dif):
         """Derivative of estimated rdn w.r.t. H2O_ABSCO
         H2OSTR is implemented by default and explicitely here
         """
@@ -180,12 +159,12 @@ class RadiativeTransfer:
         ])
         point = point.at[1, i].set(point[1, i] * perturb)
 
-        L_atm = jlut['rhoatm'](point)
-        L_dir_dir = jlut['dir_dir'](point)
-        L_dir_dif = jlut['dir_dif'](point)
-        L_dif_dir = jlut['dif_dir'](point)
-        L_dif_dif = jlut['dif_dif'](point)
-        s_alb = jlut['sphalb'](point)
+        L_atm = self.jlut['rhoatm'](point)
+        L_dir_dir = self.jlut['dir_dir'](point)
+        L_dir_dif = self.jlut['dir_dif'](point)
+        L_dif_dir = self.jlut['dif_dir'](point)
+        L_dif_dif = self.jlut['dif_dif'](point)
+        s_alb = self.jlut['sphalb'](point)
 
         rdn = self.calc_rdn(
             rho_dir,

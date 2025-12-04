@@ -93,7 +93,8 @@ def multilinear_interpolator(
     values,
     wl,
     extrapolate=False,
-    fill_value=jnp.nan
+    fill_value=jnp.nan,
+    batched=True
 ):
     """
     JIT‑compiled multi-linear regular‑grid interpolator.
@@ -116,8 +117,6 @@ def multilinear_interpolator(
     """
     axes, inv_spacings = prepare_grid(grid_axes)
 
-    @jax.jit
-    @jax.vmap
     def batched_interp(xi):
         if not extrapolate:
             out_of_bounds = jnp.any(
@@ -136,7 +135,11 @@ def multilinear_interpolator(
             # TODO check extrapolation behavior
             return interp_point(xi, axes, inv_spacings, values, wl)
 
-    return batched_interp
+    if batched:
+        return jax.jit(jax.vmap(batched_interp))
+    else:
+        return batched_interp
+
 
 
 def batch_interp1d(grid):

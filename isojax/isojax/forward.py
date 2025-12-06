@@ -140,8 +140,8 @@ class ForwardModel:
     def calc_meas(self, x, L_atm, s_alb, L_dir_dir, L_dif_dir, L_dir_dif, L_dif_dif):
 
         return self.RT.calc_rdn(
-            x,
-            x,
+            x[:len(self.idx_surface)],
+            x[:len(self.idx_surface)],
             L_atm,
             s_alb,
             L_dir_dir,
@@ -150,10 +150,10 @@ class ForwardModel:
             L_dif_dif,
         )
 
-    def Seps(self, x, meas, points):
+    def Seps(self, rho, meas, points):
 
         Sy = self.instrument.Sy(meas)
-        Kb = self.Kb(meas, x, points)
+        Kb = self.Kb(meas, rho, points)
 
         dot = jnp.einsum(
             'ij,jl->il',
@@ -166,7 +166,7 @@ class ForwardModel:
 
         return Sy + dot + self.model_discrepancy
 
-    def Kb(self, meas, x, points):
+    def Kb(self, meas, rho, point):
         """Derivative of measurement with respect to unmodeled & unretrieved
         unknown variables, e.g. S_b. This is  the concatenation of Jacobians
         with respect to parameters of the surface, radiative transfer model,
@@ -175,18 +175,13 @@ class ForwardModel:
 
         Has to be part of vmap??
         """
-        dRTb = self.RT.drdn_dRTb(
-            points,
-            x,
-            x,
-        )
-
+        dRTb = self.RT.drdn_dRTb(rho, point)
         dinstrumentb = self.instrument.dmeas_dinstrumentb(meas)
 
         return jnp.concatenate((dRTb[:, None], dinstrumentb), axis=1)
 
-    def xa(self, x, lamb_norm):
-        xa_surface = self.surface.xa(x, lamb_norm)
+    def xa(self, rho, lamb_norm):
+        xa_surface = self.surface.xa(rho, lamb_norm)
         xa_RT = self.RT.xa
 
         return jnp.concatenate([xa_surface, xa_RT])

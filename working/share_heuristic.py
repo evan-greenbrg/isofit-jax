@@ -12,7 +12,6 @@ from isofit.radiative_transfer.luts import load
 from isofit.core.common import envi_header
 from isofit.core.fileio import initialize_output
 
-from isojax.forward import ForwardModel
 from isojax.lut import lut_grid, check_bounds
 from isojax.common import construct_point_list
 

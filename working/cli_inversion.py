@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from jax import lax
 import numpy as np
 from spectral import envi
+import optax
 
 from isofit.configs import configs
 from isofit.radiative_transfer.luts import load
@@ -14,8 +15,8 @@ from isofit.core.fileio import initialize_output
 
 from isojax.forward import ForwardModel
 from isojax.lut import lut_grid, check_bounds
-from isojax.inversions import invert_algebraic, heuristic_atmosphere, InvertAnalytical
-from isojax.common import construct_point_list
+from isojax.inversions import invert_algebraic, HeuristicAtmosphere, InvertAnalytical, Invert
+from isojax.common import construct_point_list, batch_and_shard, stack_arrays
 
 # Future GPU handling
 gpu = False
@@ -41,7 +42,7 @@ def cli():
 @click.option("--fixed_aod", default=0.1)
 @click.option("--batchsize", default=1000)
 def heuristic(lut_path, rdn_file, obs_file, loc_file, out_file,
-         fixed_aod=0.1, batchsize=1000):
+              fixed_aod=0.1, batchsize=200):
 
     lut = load(lut_path)
     lut_names = list(lut.coords)[2:]
@@ -78,23 +79,41 @@ def heuristic(lut_path, rdn_file, obs_file, loc_file, out_file,
         aod=0.1, h2o=2.0
     )
 
+    meas_shards, last_meas = batch_and_shard(jnp.array(meas_list), batchsize, n_cores)
+    point_shards, last_point = batch_and_shard(point_list, batchsize, n_cores)
+
     b865 = np.argmin(abs(wl - 865))
     b945 = np.argmin(abs(wl - 945))
     b1040 = np.argmin(abs(wl - 1040))
 
-    h2os = heuristic_atmosphere(
-        jnp.array(np.unique(lut.coords['H2OSTR'].data)),
-        meas_list,
-        point_list,
-        jlut,
-        fix_aod=fixed_aod,
-        batchsize=batchsize,
-        b865=b865,
-        b945=b945,
-        b1040=b1040,
-        nshard=n_cores
-    )
+    h2o_grid = jnp.array(np.unique(lut.coords['H2OSTR'].data))
+    hatm = HeuristicAtmosphere(h2o_grid, jlut, b865, b945, b1040)
 
+    get_ratio_vmap = jax.jit(jax.vmap(hatm.get_ratio_vmap, in_axes=(None, 0, 0)))
+    get_ratio_pmap = jax.pmap(get_ratio_vmap, in_axes=(None, 0, 0))
+
+    min1d_vmap = jax.jit(jax.vmap(hatm.min1d, in_axes=(0)))
+    min1d_pmap = jax.pmap(min1d_vmap, in_axes=(0))
+
+    h2os = []
+    total_start = time.time()
+    for i, (meas_shard, point_shard) in enumerate(zip(meas_shards, point_shards)):
+        start = time.time()
+        print(f"Shard: {i} of {len(meas_shards)}")
+        ratios = get_ratio_pmap(h2o_grid, point_shard, meas_shard)
+        h2o = min1d_pmap(ratios)
+        h2o.block_until_ready()
+
+        h2os.append(h2o)
+        end = time.time()
+        print(f"Finished_batch: {round(end - start, 2)}s")
+    total_end = time.time()
+    print(f"Finished_all: {round(total_end - total_start, 2)}s")
+
+    ratios = get_ratio_vmap(h2o_grid, last_point, last_meas)
+    h2o = min1d_vmap(ratios)
+
+    h2os = stack_arrays(h2os, h2o)
     h2os = np.reshape(h2os, (rdn.shape[0], rdn.shape[1]))
     aods = np.ones(h2os.shape) * fixed_aod
     atm = np.concatenate([
@@ -212,6 +231,16 @@ def algebraic(lut_path, rdn_file, obs_file, loc_file, atm_file, out_file):
     del out
 
 
+@cli.command('oe')
+@click.argument('config_file')
+@click.argument('lut_file')
+@click.argument('rdn_file')
+@click.argument('obs_file')
+@click.argument('loc_file')
+@click.argument('x0_file')
+@click.argument('atm_file')
+@click.argument('out_file')
+@click.option('--batchsize', default=200)
 def invert_oe(
     config_file: str,
     lut_file: str, 
@@ -219,8 +248,8 @@ def invert_oe(
     obs_file: str,
     loc_file: str,
     x0_file: str,
+    atm_file: str,
     out_file: str,
-    index_file: str=None,
     batchsize: int=200
 ):
     config_file='/Users/bgreenbe/Projects/AOD/emit20220818t205752_blackrock_6c/config/emit20220818t205752_isofit.json'
@@ -229,8 +258,8 @@ def invert_oe(
     obs_file='/Users/bgreenbe/Projects/AOD/emit20220818t205752_blackrock/input/emit20220818t205752_o23014_s000_l1b_obs_b0106_v01.img'
     loc_file='/Users/bgreenbe/Projects/AOD/emit20220818t205752_blackrock/input/emit20220818t205752_o23014_s000_l1b_loc_b0106_v01.img'
     x0_file='/Users/bgreenbe/Github/isofit-jax/working/algebraic_rfl'
+    atm_file='/Users/bgreenbe/Github/isofit-jax/working/heuristic_atm'
     out_file='/Users/bgreenbe/Github/isofit-jax/working/analytical_rfl'
-    sub_file='/Users/bgreenbe/Github/isofit-jax/working/algebraic_rfl'
     batchsize=200
 
     # Load LUT
@@ -282,21 +311,6 @@ def invert_oe(
         (rdn_im.shape[0] * rdn_im.shape[1], atm_im.shape[2])
     )
 
-    # Load sub file
-    if index_file:
-        # Expects subs file to be shorter than per-pixel
-        raise NotImplementedError('Need to add support for indexed subs file')
-
-    else:
-        # Expects subs file to be same dim as per-pixel
-        sub = envi.open(envi_header(sub_file))
-        sub_im = sub.open_memmap(interleave='bip')
-
-        sub_list = np.reshape(
-            sub_im,
-            (rdn_im.shape[0] * rdn_im.shape[1], sub_im.shape[2])
-        )
-
     # Construct "Geom"
     point_list = construct_point_list(
         lut,
@@ -307,6 +321,134 @@ def invert_oe(
 
     x0_norm = jnp.linalg.norm(x0_list[:, fm.surface.idx_ref], axis=1)
     cis = fm.surface.component(x0_list, x0_norm[:, jnp.newaxis])
+
+    # Batching and sharding
+    x0_shards, last_x0 = batch_and_shard(x0_list, batchsize, n_cores)
+    meas_shards, last_meas = batch_and_shard(jnp.array(meas_list), batchsize, n_cores)
+    point_shards, last_point = batch_and_shard(point_list, batchsize, n_cores)
+    ci_shards, last_ci = batch_and_shard(cis, batchsize, n_cores)
+    lamb_norm_shards, last_lamb_norm = batch_and_shard(x0_norm, batchsize, n_cores)
+    atm_shards, last_atm = batch_and_shard(atm_flat, batchsize, n_cores)
+    print(f"Running in {len(meas_shards)} shards")
+
+    # TODO put some hcained constraints to help stability in gradients
+    # e.g. optax.clip_by_global_norm(1.0), but values have to be properly scaled
+    transforms = {
+        'surface': optax.adam(learning_rate=3e-3),
+        'aod': optax.adam(learning_rate=2e-3),
+        'h2o': optax.adam(learning_rate=1e-1),
+    }
+    optimizer = optax.multi_transform(
+        transforms,
+        {'surface': 'surface', 'aod': 'aod', 'h2o': 'h2o'}
+    )
+
+    iv = Invert(fm, optimizer)
+    inv_vmap = jax.jit(jax.vmap(iv.run, in_axes=(0, 0, 0, 0, 0)))
+    inv_pmap = jax.pmap(inv_vmap, in_axes=(0, 0, 0, 0, 0))
+
+    xs = []
+    grads = []
+    losses = []
+    total_start = time.time()
+    for i, (
+        x0_shard, 
+        meas_shard, 
+        point_shard,
+        ci_shard,
+        lamb_norm_shard,
+        atm_shard,
+    ) in enumerate(
+        zip(
+            x0_shards,
+            meas_shards,
+            point_shards,
+            ci_shards,
+            lamb_norm_shards,
+            atm_shards,
+        )
+    ):
+        print(f"Shard: {i} of {len(meas_shards)}")
+        start = time.time()
+        params = jnp.concatenate([x0_shard, atm_shard], axis=2)
+        (
+            x, 
+            grad, 
+            loss, 
+        ) = inv_pmap(
+            params,
+            meas_shard,
+            point_shard,
+            ci_shard[..., jnp.newaxis],
+            lamb_norm_shard[..., jnp.newaxis],
+        )
+        loss.block_until_ready()
+        break
+
+        xs.append(x)
+        grads.append(grad)
+        losses.append(oss)
+        end = time.time()
+        print(f"Finished_batch: {round(end - start, 2)}s")
+        if i == 5:
+            break
+
+    print(f"Last shard: {len(meas_shards)} of {len(meas_shards)}")
+    last_params = jnp.concatenate([x0_shard, atm_shard], axis=2)
+    (
+        x, 
+        grad, 
+        loss, 
+    ) = inv_vmap(
+        last_x0,
+        last_meas,
+        last_point,
+        last_ci[..., jnp.newaxis],
+        last_lamb_norm[..., jnp.newaxis],
+        last_atm,
+    )
+    total_end = time.time()
+    print(f"Finished_all: {round(total_end - total_start, 2)}s")
+
+    # Construct outputs
+    x_surfaces = stack_arrays(x_surfaces, x_surface)
+    x_aods = stack_arrays(x_aods, x_aod)
+    x_h2os = stack_arrays(x_h2os, x_h2o)
+
+    grad_surfaces = stack_arrays(grad_surfaces, grad_surface)
+    grad_aods = stack_arrays(grad_aods, grad_aod)
+    grad_h2os = stack_arrays(grad_h2os, grad_h2o)
+
+    # Stack into state image
+    x = np.concatenate([
+        x_surfaces,
+        x_aods[:, None],
+        x_h2os[:, None]
+    ], axis=1)
+
+    x_im = np.reshape(x, (rdn.shape[0], rdn.shape[1], x.shape[-1]))
+    x_im = np.moveaxis(x_im, -1, 1)
+
+    output = initialize_output(
+        {
+            "data type": 4,
+            "file type": "ENVI Standard",
+            "byte order": 0,
+        },
+        out_file,
+        (x_im.shape[0], x_im.shape[1], x_im.shape[2]),
+        lines=rdn.metadata["lines"],
+        samples=rdn.metadata["samples"],
+        interleave="bil",
+        bands=f"{x_im.shape[1]}",
+        band_names=[rdn.metadata['band names']] + ['AOD', 'H2O'],
+        description=("OE inversion"),
+    )
+    out = envi.open(envi_header(output)).open_memmap(
+        interleave="bil", writable=True
+    )
+    out[...] = x_im
+    del out
 
 
 @cli.command('analytical')
@@ -608,108 +750,4 @@ if __name__ == '__main__':
     cli()
 
 
-# SCRATCH
 
-iv = Invert(fm)
-
-def fit(param, meas, point, xa, Sa, opt_state):
-    value, grad = iv.step()(param, meas, point, xa, Sa)
-    updates, opt_state = optimizer.update(grad, opt_state)
-    params = optax.apply_updates(param, updates)
-
-    return params, opt_state, grad
-
-fit_vmap = jax.jit(jax.vmap(fit))
-learning_rate = 3e-3
-# optimizer = optax.adam(learning_rate)
-nsteps=100
-
-cmap_name = 'winter'
-cmap = plt.get_cmap(cmap_name)
-colors = [cmap(i) for i in np.linspace(0, 1, nsteps)]
-
-for i in range(2):
-# Set up the inversion for a single pixel
-    x = x0[i, ...]
-    meas = meas_list[i, ...]
-    point = point_list[i, ...]
-    ci = cis[i]
-    lamb_norm = x0_norm[i]
-    atm = atm_flat[i, ...]
-
-    seps = fm.Seps(x, meas, point)
-    seps_inv_sqrt = svd_inv_sqrt(seps)
-    xa = fm.xa(x, lamb_norm)
-    Sa, Sa_inv, Sa_inv_sqrt = fm.Sa(
-        ci,
-        lamb_norm
-    )
-
-
-    param = {
-        'surface': x,
-        'aod': atm[0],
-        'h2o': atm[1],
-    }
-    transforms = {
-        'surface': optax.adam(learning_rate=3e-3),
-        'aod': optax.adam(learning_rate=3e-3),
-        'h2o': optax.adam(learning_rate=1e-1),
-    }
-    optimizer = optax.multi_transform(
-        transforms,
-        {'surface': 'surface', 'aod': 'aod', 'h2o': 'h2o'}
-    )
-
-    opt_state = optimizer.init(param)
-
-    params = []
-    grads = []
-    for i in range(nsteps):
-        print(i)
-        param, opt_state, grad = fit(param, meas, point, xa, Sa, opt_state)
-        params.append(param)
-        grads.append(grad)
-
-    # TODO The gradients are bad. The optimization is wrong.
-    for param, grad in zip(params, grads):
-        break
-    params = np.array(params)
-    grads = np.array(grads)
-
-    fig, axs = plt.subplots(2, 1, sharex=True)
-    for i in range(nsteps):
-        axs[0].plot(wl, params[i,:285], color=colors[i])
-        axs[1].plot(wl, grads[i,:285], color=colors[i])
-    # plt.plot(wl, params[0, :], color='black', ls='--', lw=2)
-    # plt.plot(wl, params[-1, :], color='black', lw=2)
-    axs[0].set_ylim([-.05, .5])
-    # axs[1].set_ylim([-.05, .5])
-    plt.show()
-
-    fig, axs = plt.subplots(2, 2, sharex=True)
-    axs[0, 0].set_ylabel('AOD')
-    axs[0, 0].scatter(
-        [i for i in range(nsteps)],
-        params[:, -2]
-    )
-    axs[1, 0].set_ylabel('AOD Grad')
-    axs[1, 0].scatter(
-        [i for i in range(nsteps)],
-        grads[:, -2]
-    )
-    axs[0, 1].set_ylabel('H2O')
-    axs[0, 1].scatter(
-        [i for i in range(nsteps)],
-        params[:, -1]
-    )
-    axs[1, 1].set_ylabel('H2O Grad')
-    axs[1, 1].scatter(
-        [i for i in range(nsteps)],
-        grads[:, -1]
-    )
-    plt.show()
-    break
-
-# Set up params
-opt_state = optimizer.init(params)

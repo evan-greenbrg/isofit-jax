@@ -147,10 +147,12 @@ class RadiativeTransfer:
             ) / (1 - s_alb * rho_dif_dir)
         )
 
-    def drdn_dRTb(self, point, rho_dir, rho_dif):
+    def drdn_dRTb(self, rho, point):
         """Derivative of estimated rdn w.r.t. H2O_ABSCO
         H2OSTR is implemented by default and explicitely here
         """
+        rho_dir = rho_dif = rho
+
         i = self.statevec_names.index("H2OSTR")
         perturb = 1.0 + eps
         point = jnp.vstack([

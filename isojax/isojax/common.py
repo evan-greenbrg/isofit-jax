@@ -1,6 +1,7 @@
 import os
 
 import numpy as np
+import jax.numpy as jnp
 
 from isojax.lut import check_bounds
 
@@ -64,3 +65,29 @@ def construct_point_list(lut, obs_flat, loc_flat, aod=0.1, h2o=2.0):
         bounds[:, 0],
         bounds[:, 1]
     )
+
+
+def batch_and_shard(ar, batchsize, n_cores):
+    # Not ideal to call these indexing functions for each array
+    # Not too expensive
+    indices = np.arange(batchsize, len(ar), batchsize)
+    ar_batches = np.array_split(
+        ar, indices, axis=0
+    )
+    last_ar = ar_batches[-1]
+    ar_batches = jnp.array(ar_batches[:-1])
+
+    indices = np.arange(n_cores, len(ar_batches), n_cores)
+    ar_shards = np.array_split(ar_batches, indices, axis=0)
+
+    return ar_shards, last_ar
+
+
+def stack_arrays(ar, last_ar):
+    ar = np.concatenate(
+        np.concatenate(ar, axis=0),
+        axis=0
+    )
+    ar = np.concatenate([ar, last_ar], axis=0)
+
+    return ar

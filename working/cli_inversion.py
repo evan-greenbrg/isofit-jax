@@ -394,8 +394,6 @@ def invert_oe(
         losses.append(loss)
         end = time.time()
         print(f"Finished_batch: {round(end - start, 2)}s")
-        if i == 5:
-            break
 
     print(f"Last shard: {len(meas_shards)} of {len(meas_shards)}")
     last_params = jnp.concatenate([x0_shard, atm_shard], axis=2)

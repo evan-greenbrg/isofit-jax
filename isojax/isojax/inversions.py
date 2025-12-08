@@ -1,5 +1,6 @@
 from copy import deepcopy
 from functools import partial
+import typing
 
 import numpy as np
 import jax
@@ -35,6 +36,17 @@ class Parameter:
         )
 
 
+class State(typing.NamedTuple):
+    step: int
+    param: jnp.ndarray
+    loss: jnp.ndarray
+    prev_loss: jnp.ndarray
+    grad: jnp.ndarray
+    opt_state: optax.transforms._combining.PartitionState
+    patience: int
+    done: bool
+
+
 class Invert:
     def __init__(self, fm, optimizer, nsteps=20):
         self.fm = fm
@@ -44,9 +56,13 @@ class Invert:
         self.winidx_mask = jnp.zeros(len(fm.idx_surface))
         self.winidx_mask = self.winidx_mask.at[self.winidx].set(1)
 
-        # This should be dynamic
         self.idx_surface = 285
+
+        # Manually tuned. Not that well...
         self.nsteps = nsteps
+        self.grad_tol = 1000
+        self.loss_tol = 50
+        self.max_patience = 50
 
     def step(self):
         def loss(param, meas, point, xa, Sa_inv_sqrt, seps_inv_sqrt):
@@ -87,7 +103,7 @@ class Invert:
 
         return jax.value_and_grad(loss)
 
-    def run(self, x, meas, point, ci, lamb_norm, atm):
+    def run(self, x, meas, point, ci, lamb_norm):
         # TODO The optimization call can be improved
         # I've tried a number of jaxopt calls.
         # I've only gotten scipyboundedminimize to work, but this is
@@ -96,48 +112,84 @@ class Invert:
         # That seemed the most promising combined with a transformation
         # TODO
 
-        seps = self.fm.Seps(x, meas, point)
+        seps = self.fm.Seps(x[:self.idx_surface], meas, point)
         seps_inv_sqrt = svd_inv_sqrt(seps)
-        xa = self.fm.xa(x, lamb_norm)
+        xa = self.fm.xa(x[:self.idx_surface], lamb_norm)
         Sa, Sa_inv, Sa_inv_sqrt = self.fm.Sa(
             ci[0],
             lamb_norm[0]
         )
 
-        def fit(i, args):
-            param, _, opt_state = args
+        def cond(state):
+            return jnp.logical_and(
+                state.step < self.nsteps,
+                jnp.logical_not(state.done)
+            )
+
+        def fit(state):
+            # There's got to be a way to carry fit information in opt_state
             loss, grad = self.step()(
-                param, 
+                state.param, 
                 meas, point, xa, Sa_inv_sqrt, seps_inv_sqrt
             )
-            updates, opt_state = self.optimizer.update(grad, opt_state)
-            params = optax.apply_updates(param, updates)
+            updates, opt_state = self.optimizer.update(
+                grad, state.opt_state
+            )
+            param = optax.apply_updates(state.param, updates)
 
-            return params, grad, opt_state
+            grad_norm = optax.global_norm(grad)
+            improved = jnp.greater(
+                state.prev_loss - self.loss_tol, 
+                loss
+            )
+            patience = jnp.where(
+                improved, 0, state.patience + 1
+            )
+
+            new_state = State(
+                step=state.step + 1,
+                param=param,
+                loss=loss,
+                prev_loss=state.loss,
+                grad=grad,
+                opt_state=opt_state,
+                patience=patience,
+                done=jnp.logical_or(
+                    grad_norm < self.grad_tol,
+                    patience >= self.max_patience,
+                )
+            )
+
+            return new_state
         
         param = {
-            'surface': x,
-            'aod': atm[0],
-            'h2o': atm[1],
+            'surface': x[:self.idx_surface],
+            'aod': x[self.idx_surface],
+            'h2o': x[self.idx_surface + 1],
         }
         opt_state = self.optimizer.init(param)
-
-        # TODO
-        # Add stopping criteria THAT WORKS
-        args = jax.lax.fori_loop(
-            0, self.nsteps,
-            fit,
-            (param, param, opt_state)
+        state = State(
+            step=0,
+            param=param,
+            loss=jnp.inf,
+            prev_loss=jnp.inf,
+            grad=param,
+            opt_state=opt_state,
+            patience=0,
+            done=False,
         )
-        param, grad, opt_state = args
+        # With stopping criteria
+        final = jax.lax.while_loop(cond, fit, state)
         
         return (
-            param['surface'], 
-            param['aod'],
-            param['h2o'],
-            grad['surface'],
-            grad['aod'],
-            grad['h2o'],
+            final.param['surface'], 
+            final.param['aod'],
+            final.param['h2o'],
+            final.grad['surface'],
+            final.grad['aod'],
+            final.grad['h2o'],
+            final.loss,
+            final.step
         )
 
 

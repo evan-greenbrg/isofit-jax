@@ -252,16 +252,6 @@ def invert_oe(
     out_file: str,
     batchsize: int=200
 ):
-    config_file='/Users/bgreenbe/Projects/AOD/emit20220818t205752_blackrock_6c/config/emit20220818t205752_isofit.json'
-    lut_file='/Users/bgreenbe/Projects/AOD/emit20220818t205752_blackrock_6c/lut_full/lut.nc'
-    rdn_file='/Users/bgreenbe/Projects/AOD/emit20220818t205752_blackrock/input/emit20220818t205752_o23014_s000_l1b_rdn_b0106_v01.img'
-    obs_file='/Users/bgreenbe/Projects/AOD/emit20220818t205752_blackrock/input/emit20220818t205752_o23014_s000_l1b_obs_b0106_v01.img'
-    loc_file='/Users/bgreenbe/Projects/AOD/emit20220818t205752_blackrock/input/emit20220818t205752_o23014_s000_l1b_loc_b0106_v01.img'
-    x0_file='/Users/bgreenbe/Github/isofit-jax/working/algebraic_rfl'
-    atm_file='/Users/bgreenbe/Github/isofit-jax/working/heuristic_atm'
-    out_file='/Users/bgreenbe/Github/isofit-jax/working/analytical_rfl'
-    batchsize=200
-
     # Load LUT
     lut = load(lut_file)
     lut_names = list(lut.coords)[2:]
@@ -343,7 +333,7 @@ def invert_oe(
         {'surface': 'surface', 'aod': 'aod', 'h2o': 'h2o'}
     )
 
-    iv = Invert(fm, optimizer)
+    iv = Invert(fm, optimizer, nsteps=500)
     inv_vmap = jax.jit(jax.vmap(iv.run, in_axes=(0, 0, 0, 0, 0)))
     inv_pmap = jax.pmap(inv_vmap, in_axes=(0, 0, 0, 0, 0))
 
@@ -372,9 +362,14 @@ def invert_oe(
         start = time.time()
         params = jnp.concatenate([x0_shard, atm_shard], axis=2)
         (
-            x, 
-            grad, 
+            x_surface, 
+            x_aod, 
+            x_h2o, 
+            grad_surface, 
+            grad_aod, 
+            grad_h2o, 
             loss, 
+            step
         ) = inv_pmap(
             params,
             meas_shard,
@@ -382,12 +377,21 @@ def invert_oe(
             ci_shard[..., jnp.newaxis],
             lamb_norm_shard[..., jnp.newaxis],
         )
-        loss.block_until_ready()
-        break
+        loss = loss.block_until_ready()
 
-        xs.append(x)
-        grads.append(grad)
-        losses.append(oss)
+        xs.append(np.concatenate([
+            x_surface, 
+            x_aod[..., None],
+            x_h2o[..., None]
+        ], axis=-1))
+
+        grads.append(np.concatenate([
+            grad_surface, 
+            grad_aod[..., None],
+            grad_h2o[..., None]
+        ], axis=-1))
+
+        losses.append(loss)
         end = time.time()
         print(f"Finished_batch: {round(end - start, 2)}s")
         if i == 5:
@@ -396,8 +400,12 @@ def invert_oe(
     print(f"Last shard: {len(meas_shards)} of {len(meas_shards)}")
     last_params = jnp.concatenate([x0_shard, atm_shard], axis=2)
     (
-        x, 
-        grad, 
+        x_surface, 
+        x_aod, 
+        x_h2o, 
+        grad_surface, 
+        grad_aod, 
+        grad_h2o, 
         loss, 
     ) = inv_vmap(
         last_x0,

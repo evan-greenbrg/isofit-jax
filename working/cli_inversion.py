@@ -396,7 +396,7 @@ def invert_oe(
         print(f"Finished_batch: {round(end - start, 2)}s")
 
     print(f"Last shard: {len(meas_shards)} of {len(meas_shards)}")
-    last_params = jnp.concatenate([x0_shard, atm_shard], axis=2)
+    last_params = jnp.concatenate([last_x0, last_atm], axis=-1)
     (
         x_surface, 
         x_aod, 
@@ -405,34 +405,37 @@ def invert_oe(
         grad_aod, 
         grad_h2o, 
         loss, 
+        step
     ) = inv_vmap(
-        last_x0,
+        last_params,
         last_meas,
         last_point,
         last_ci[..., jnp.newaxis],
         last_lamb_norm[..., jnp.newaxis],
-        last_atm,
     )
     total_end = time.time()
     print(f"Finished_all: {round(total_end - total_start, 2)}s")
+    x = np.concatenate([
+        x_surface, 
+        x_aod[..., None],
+        x_h2o[..., None]
+    ], axis=-1)
+
+    grad = np.concatenate([
+        grad_surface, 
+        grad_aod[..., None],
+        grad_h2o[..., None]
+    ], axis=-1)
 
     # Construct outputs
-    x_surfaces = stack_arrays(x_surfaces, x_surface)
-    x_aods = stack_arrays(x_aods, x_aod)
-    x_h2os = stack_arrays(x_h2os, x_h2o)
-
-    grad_surfaces = stack_arrays(grad_surfaces, grad_surface)
-    grad_aods = stack_arrays(grad_aods, grad_aod)
-    grad_h2os = stack_arrays(grad_h2os, grad_h2o)
+    xs = stack_arrays(xs, x)
+    grads = stack_arrays(grads, grad)
 
     # Stack into state image
-    x = np.concatenate([
-        x_surfaces,
-        x_aods[:, None],
-        x_h2os[:, None]
-    ], axis=1)
-
-    x_im = np.reshape(x, (rdn.shape[0], rdn.shape[1], x.shape[-1]))
+    x_im = np.reshape(
+        xs,
+        (rdn.shape[0], rdn.shape[1], xs.shape[-1])
+    )
     x_im = np.moveaxis(x_im, -1, 1)
 
     output = initialize_output(

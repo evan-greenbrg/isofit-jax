@@ -62,7 +62,7 @@ class Invert:
         self.nsteps = nsteps
         self.grad_tol = 1000
         self.loss_tol = 50
-        self.max_patience = 50
+        self.max_patience = 30
 
     def step(self):
         def loss(param, meas, point, xa, Sa_inv_sqrt, seps_inv_sqrt):
@@ -104,14 +104,6 @@ class Invert:
         return jax.value_and_grad(loss)
 
     def run(self, x, meas, point, ci, lamb_norm):
-        # TODO The optimization call can be improved
-        # I've tried a number of jaxopt calls.
-        # I've only gotten scipyboundedminimize to work, but this is
-        # limited in how it's called.
-        # Could try to get jax.scipy.minimize to work
-        # That seemed the most promising combined with a transformation
-        # TODO
-
         seps = self.fm.Seps(x[:self.idx_surface], meas, point)
         seps_inv_sqrt = svd_inv_sqrt(seps)
         xa = self.fm.xa(x[:self.idx_surface], lamb_norm)
@@ -200,7 +192,7 @@ class InvertAnalytical:
     def invert(self, x, meas, point, sub, s_alb,
                           L_tot, L_atm, ci, lamb_norm):
 
-        seps = self.fm.Seps(x, meas, point)
+        seps = self.fm.Seps(x[:self.idx_surface], meas, point)
 
         H = self.fm.surface.analytical_model(
             jnp.multiply(sub, s_alb),
@@ -208,10 +200,10 @@ class InvertAnalytical:
         )
 
         Sa, Sa_inv, Sa_inv_sqrt = self.fm.surface.Sa(
-            ci,
-            lamb_norm
+            ci[0],
+            lamb_norm[0]
         )
-        xa = self.fm.surface.xa(x, lamb_norm)
+        xa = self.fm.surface.xa(x[:self.idx_surface], lamb_norm)
         prprod = jnp.matmul(Sa_inv, xa)
 
         C = jax.lax.linalg.cholesky(seps)
